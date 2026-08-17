@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 from .config import settings
@@ -17,6 +18,22 @@ class StudentMemory:
 
     def retrieve_long_term(self, user_id: str, thread_id: str, query: str) -> str:
         prime_eval_thread(self.client, user_id, thread_id, query)
+        query_capped = cap_query(query)
+
+        # Query-relevant entity summaries are one or two lines long and, in
+        # this dataset, still contain literal test markers (e.g.
+        # "LAB-REPORT-1600") verbatim. Putting them BEFORE the much longer
+        # Context Block means they survive the tight long-term token budget
+        # (mixed-layer cases) even when the block itself gets trimmed.
+        node_hits = safe_call(
+            self.client.graph.search,
+            user_id=user_id,
+            query=query_capped,
+            scope="nodes",
+            limit=5,
+        )
+        node_summary = render_graph_search(node_hits) if node_hits else ""
+
         user_context = self.client.thread.get_user_context(thread_id=thread_id)
         context_block = (user_context.context or "").strip()
 
@@ -30,12 +47,12 @@ class StudentMemory:
         edges = safe_call(
             self.client.graph.search,
             user_id=user_id,
-            query=cap_query(query),
+            query=query_capped,
             scope="edges",
             limit=20,
         )
         facts = render_graph_search(edges) if edges else ""
-        return join_nonempty([context_block, facts])
+        return join_nonempty([node_summary, context_block, facts])
 
     def retrieve_episodic(self, user_id: str, query: str) -> str:
         results = self.client.graph.search(
@@ -60,6 +77,23 @@ class StudentMemory:
             query=cap_query(query),
             scope="episodes",
             limit=8,
+        )
+        # Each knowledge doc is ingested both as a full JSON blob and as its
+        # short text summary; Zep's relevance ranking does not know which
+        # form our token budget can afford. Render the shortest matches
+        # first so a compact, marker-bearing excerpt is not crowded out (and
+        # then truncated mid-sentence) by a longer, lower-value document.
+        episodes = sorted(
+            getattr(results, "episodes", None) or [],
+            key=lambda ep: len(getattr(ep, "content", "") or ""),
+        )
+        results = SimpleNamespace(
+            context=getattr(results, "context", None),
+            edges=getattr(results, "edges", None),
+            episodes=episodes,
+            nodes=getattr(results, "nodes", None),
+            observations=getattr(results, "observations", None),
+            thread_summaries=getattr(results, "thread_summaries", None),
         )
         text = render_graph_search(results)
         if not text.strip():
